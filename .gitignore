@@ -44,3 +44,7 @@ logs/
 # OS specific files
 .DS_Store
 Thumbs.db
+
+pretrained_models/
+enrollments/
+debug_audio/
