@@ -46,5 +46,3 @@ logs/
 Thumbs.db
 
 pretrained_models/
-enrollments/
-debug_audio/

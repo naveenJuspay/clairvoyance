@@ -227,6 +227,108 @@ class SpeakerVerificationService:
             logger.warning(f"[SPEAKER_VERIFICATION] Diarization failed: {e}, using full audio")
             return [waveform]
     
+    async def _filter_audio_by_speaker_verification(self, waveform: np.ndarray, target_speaker_id: str, threshold: float = None) -> tuple[np.ndarray, dict]:
+        """
+        Filter audio to silence unauthorized speakers while keeping enrolled speaker.
+        
+        Args:
+            waveform: Input audio waveform
+            target_speaker_id: Expected speaker identifier
+            threshold: Custom similarity threshold
+            
+        Returns:
+            Tuple of (filtered_waveform, verification_results)
+        """
+        verification_threshold = threshold or self.config.get('SPEAKER_VERIFICATION_SIMILARITY_THRESHOLD', 0.6)
+        
+        # Extract speech segments with speaker info
+        speech_segments = await self._extract_speech_segments(waveform)
+        if not speech_segments or not hasattr(self, 'last_speaker_segments'):
+            # No speaker segmentation available, fall back to normal verification
+            verification_result = await self.verify_speaker(waveform, target_speaker_id, threshold)
+            if verification_result['is_verified']:
+                return waveform, verification_result
+            else:
+                # Silence entire audio if verification fails
+                return np.zeros_like(waveform), verification_result
+        
+        # Check if target speaker exists
+        if target_speaker_id not in self.reference_embeddings:
+            return np.zeros_like(waveform), {
+                'is_verified': False,
+                'confidence': 0.0,
+                'error': f'Speaker {target_speaker_id} not enrolled'
+            }
+        
+        ref_embedding = self.reference_embeddings[target_speaker_id]
+        filtered_waveform = np.copy(waveform)
+        
+        verified_segments = 0
+        total_segments = len(speech_segments)
+        max_similarity = 0.0
+        
+        logger.info(f"[SPEAKER_VERIFICATION] Processing {total_segments} speaker segments for filtering")
+        
+        # Process each speaker segment individually
+        for i, segment in enumerate(speech_segments):
+            if i >= len(self.last_speaker_segments):
+                break
+                
+            segment_info = self.last_speaker_segments[i]
+            speaker_id = segment_info['speaker_id']
+            start_sample = segment_info['start_sample']
+            end_sample = segment_info['end_sample']
+            
+            # Extract embedding for this specific segment
+            try:
+                segment_embedding = self.model.encode_batch(torch.tensor(segment).unsqueeze(0))
+                segment_embedding = segment_embedding.squeeze().cpu().numpy()
+                
+                # Compute similarity with enrolled speaker
+                similarity = cosine_similarity(
+                    segment_embedding.reshape(1, -1),
+                    ref_embedding.reshape(1, -1)
+                )[0][0]
+                
+                max_similarity = max(max_similarity, similarity)
+                
+                if similarity >= verification_threshold:
+                    # Keep this speaker's audio (authorized)
+                    verified_segments += 1
+                    logger.debug(f"[SPEAKER_VERIFICATION] ✅ Segment {i+1} ({speaker_id}): similarity {similarity:.3f} >= {verification_threshold:.3f} - KEEPING")
+                else:
+                    # Silence this speaker's audio (unauthorized)
+                    filtered_waveform[start_sample:end_sample] = 0.0
+                    logger.debug(f"[SPEAKER_VERIFICATION] ❌ Segment {i+1} ({speaker_id}): similarity {similarity:.3f} < {verification_threshold:.3f} - SILENCING")
+                    
+            except Exception as e:
+                # If embedding extraction fails, silence the segment for safety
+                filtered_waveform[start_sample:end_sample] = 0.0
+                logger.warning(f"[SPEAKER_VERIFICATION] Failed to process segment {i+1}, silencing for safety: {e}")
+        
+        # Overall verification result
+        is_verified = verified_segments > 0
+        confidence = max_similarity
+        
+        verification_result = {
+            'is_verified': is_verified,
+            'confidence': confidence,
+            'verified_segments': verified_segments,
+            'total_segments': total_segments,
+            'filtered_segments': total_segments - verified_segments
+        }
+        
+        logger.info(f"[SPEAKER_VERIFICATION] 🎯 SPEAKER FILTERING RESULT:")
+        logger.info(f"[SPEAKER_VERIFICATION]   Target: {target_speaker_id}")
+        logger.info(f"[SPEAKER_VERIFICATION]   Total segments: {total_segments}")
+        logger.info(f"[SPEAKER_VERIFICATION]   Verified segments: {verified_segments}")
+        logger.info(f"[SPEAKER_VERIFICATION]   Silenced segments: {total_segments - verified_segments}")
+        logger.info(f"[SPEAKER_VERIFICATION]   Max similarity: {confidence:.3f}")
+        logger.info(f"[SPEAKER_VERIFICATION]   Threshold: {verification_threshold:.3f}")
+        logger.info(f"[SPEAKER_VERIFICATION]   ✅ RESULT: {'PASSED' if is_verified else 'REJECTED'}")
+        
+        return filtered_waveform, verification_result
+    
     async def _extract_segments_pyannote(self, waveform: np.ndarray) -> List[np.ndarray]:
         """Extract speech segments using pyannote.audio."""
         try:
@@ -308,8 +410,10 @@ class SpeakerVerificationService:
                 # Clean up temp file
                 os.unlink(tmp_file.name)
             
-            # Extract speech segments
+            # Extract speech segments with speaker information
             speech_segments = []
+            speaker_info = []  # Track (start_time, end_time, speaker_id) for each segment
+            
             for turn, _, speaker in diarization.itertracks(yield_label=True):
                 start_sample = int(turn.start * SAMPLE_RATE)
                 end_sample = int(turn.end * SAMPLE_RATE)
@@ -318,13 +422,24 @@ class SpeakerVerificationService:
                 segment = waveform[start_sample:end_sample]
                 if len(segment) > int(0.5 * SAMPLE_RATE):  # At least 0.5 seconds
                     speech_segments.append(segment)
+                    speaker_info.append({
+                        'start_time': turn.start,
+                        'end_time': turn.end,
+                        'start_sample': start_sample,
+                        'end_sample': end_sample,
+                        'speaker_id': speaker
+                    })
                     logger.debug(f"[SPEAKER_VERIFICATION] Found speech segment: {turn.start:.2f}s-{turn.end:.2f}s speaker_{speaker}")
+            
+            # Store speaker information for filtering
+            self.last_speaker_segments = speaker_info
             
             if speech_segments:
                 logger.info(f"[SPEAKER_VERIFICATION] Pyannote extracted {len(speech_segments)} speech segments")
                 return speech_segments
             else:
                 logger.warning("[SPEAKER_VERIFICATION] Pyannote found no speech segments, using full audio")
+                self.last_speaker_segments = []
                 return [waveform]
                 
         except Exception as e:
@@ -877,25 +992,39 @@ class SpeakerVerificationProcessor(FrameProcessor):
             await self._send_silenced_audio(frames)
             return
         
-        # Verify speaker using configured threshold
-        result = await self.verification_service.verify_speaker(waveform, self.target_speaker_id, self.similarity_threshold)
+        # Filter audio using speaker-specific verification
+        filtered_waveform, result = await self.verification_service._filter_audio_by_speaker_verification(
+            waveform, self.target_speaker_id, self.similarity_threshold
+        )
         
         if result.get('is_verified', False):
-            # Verification passed
+            # At least some authorized speech found
             self.stats['verified_segments'] += 1
             self._consecutive_rejections = 0
-            logger.info(f"[SPEAKER_VERIFICATION_PROCESSOR] ✅ VERIFIED - Confidence: {result.get('confidence', 0):.3f}")
             
-            # Send success RTVI event
+            # Log detailed filtering results
+            verified_segments = result.get('verified_segments', 0)
+            total_segments = result.get('total_segments', 1)
+            filtered_segments = result.get('filtered_segments', 0)
+            
+            logger.info(f"[SPEAKER_VERIFICATION_PROCESSOR] ✅ VERIFIED - Confidence: {result.get('confidence', 0):.3f}")
+            if filtered_segments > 0:
+                logger.info(f"[SPEAKER_VERIFICATION_PROCESSOR] 🔇 FILTERED: {filtered_segments} unauthorized segments silenced, {verified_segments} segments kept")
+            
+            # Send success RTVI event with filtering details
             await self._send_rtvi_event("speaker-verification-success", {
                 "speaker_id": self.target_speaker_id,
                 "confidence": result.get('confidence', 0),
-                "verified": True
+                "verified": True,
+                "verified_segments": verified_segments,
+                "total_segments": total_segments,
+                "filtered_segments": filtered_segments
             })
             
-            await self._forward_frames(frames)
+            # Convert filtered waveform back to frames and forward
+            await self._forward_filtered_frames(frames, filtered_waveform, waveform)
         else:
-            # Verification failed
+            # No authorized speech found - block entire audio
             self.stats['rejected_segments'] += 1
             self._consecutive_rejections += 1
             
@@ -923,6 +1052,45 @@ class SpeakerVerificationProcessor(FrameProcessor):
             logger.info(f"[SPEAKER_VERIFICATION_PROCESSOR] ❌ REJECTED - {result.get('error', 'Unknown error')}")
             await self._send_silenced_audio(frames)
             await self._send_interruption()
+    
+    async def _forward_filtered_frames(self, original_frames: List[AudioRawFrame], filtered_waveform: np.ndarray, original_waveform: np.ndarray):
+        """Forward audio frames with speaker filtering applied."""
+        if len(original_frames) == 0:
+            return
+        
+        # Convert filtered waveform back to int16
+        filtered_int16 = (filtered_waveform * 32767).astype(np.int16)
+        
+        # Reconstruct frames using exact original frame boundaries
+        start_sample = 0
+        for i, original_frame in enumerate(original_frames):
+            # Calculate exact frame size from original frame
+            original_frame_size = len(original_frame.audio) // 2  # Convert bytes to samples
+            end_sample = start_sample + original_frame_size
+            
+            if end_sample <= len(filtered_int16):
+                # Extract the corresponding filtered audio chunk (exact size)
+                filtered_chunk = filtered_int16[start_sample:end_sample]
+                filtered_bytes = filtered_chunk.tobytes()
+            else:
+                # If we run out of filtered audio, use silence but preserve original frame size
+                logger.warning(f"[SPEAKER_VERIFICATION_PROCESSOR] Frame {i+1} extends beyond filtered audio, using original frame audio")
+                filtered_bytes = original_frame.audio  # Keep original as fallback
+            
+            # Verify the frame size matches
+            if len(filtered_bytes) != len(original_frame.audio):
+                logger.error(f"[SPEAKER_VERIFICATION_PROCESSOR] Frame size mismatch: filtered={len(filtered_bytes)}, original={len(original_frame.audio)}")
+                # Use original frame as fallback to prevent corruption
+                filtered_bytes = original_frame.audio
+            
+            # Modify the original frame in place instead of creating new frame
+            # This preserves all internal state and frame pipeline compatibility
+            original_frame.audio = filtered_bytes
+            
+            await self.push_frame(original_frame)
+            start_sample = end_sample
+        
+        logger.debug(f"[SPEAKER_VERIFICATION_PROCESSOR] ➡️ Forwarded {len(original_frames)} filtered frames to STT")
     
     async def _forward_frames(self, frames: List[AudioRawFrame]):
         """Forward original frames to downstream processors."""
