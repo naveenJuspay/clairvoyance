@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import os
 import random
 from datetime import datetime
@@ -64,6 +65,7 @@ from .types import (
     decode_voice_name,
 )
 
+# Simple environment loading - subprocess inherits from parent
 load_dotenv(override=True)
 
 # import setup_tracing from tracing_setup.py file
@@ -76,12 +78,12 @@ from app.agents.voice.automatic.analytics.utils import (
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-u", "--url", type=str, required=True, help="URL of the Daily room"
+        "-u", "--url", type=str, help="URL of the Daily room"
     )
-    parser.add_argument("-t", "--token", type=str, required=True, help="Daily token")
+    parser.add_argument("-t", "--token", type=str, help="Daily token")
     parser.add_argument("--mode", type=str, help="Mode (TEST or LIVE)")
     parser.add_argument(
-        "--session-id", type=str, required=True, help="Session ID for logging"
+        "--session-id", type=str, help="Session ID for logging"
     )
     parser.add_argument("--client-sid", type=str, help="Client session ID for logging")
     parser.add_argument("--euler-token", type=str, help="Euler token for live mode")
@@ -101,7 +103,221 @@ async def main():
         help="Platform Integrations that are supported by the shop (string array)",
     )
     parser.add_argument("--reseller-id", type=str, help="Reseller ID")
+    
+    # Pool mode arguments
+    parser.add_argument("--pool-mode", action="store_true", help="Run in pool mode")
+    parser.add_argument("--process-id", type=str, help="Process ID for pool mode")
+    
     args = parser.parse_args()
+    
+    if args.pool_mode:
+        await run_pool_mode(args)
+    else:
+        await run_normal_mode(args)
+
+
+async def run_pool_mode(args):
+    """Run in pool mode - wait for session assignments"""
+    logger.info(f"Voice agent process {args.process_id} starting in pool mode")
+    
+    try:
+        await pre_initialize_services()
+        print("READY", flush=True)
+        
+        # Wait for session assignments
+        import sys
+        while True:
+            try:
+                line = sys.stdin.readline()
+                if line.strip():
+                    session_config = json.loads(line.strip())
+                    await handle_session(session_config)
+            except EOFError:
+                logger.info("Pool process received EOF, shutting down")
+                break
+            except Exception as e:
+                logger.error(f"Error in pool mode: {e}")
+                break
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize pool mode: {e}")
+        print(f"ERROR: {e}", flush=True)
+    
+    logger.info("Pool process shutting down")
+
+
+async def pre_initialize_services():
+    """Pre-load heavy services for faster session startup"""
+    logger.info("Pre-initializing services for pool mode")
+    
+    try:
+        # Pre-initialize Azure OpenAI connection
+        await _pre_init_azure_llm()
+        
+        # Pre-initialize system tools
+        await _pre_init_system_tools()
+        
+        # Pre-initialize Silero VAD model
+        await _pre_init_silero_vad()
+        
+        logger.info("Services pre-initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"Error during service pre-initialization: {e}")
+        # Don't fail the process - fallback to normal initialization
+        logger.info("Continuing with normal initialization fallback")
+
+
+async def _pre_init_azure_llm():
+    """Pre-initialize Azure OpenAI connection"""
+    try:
+        from app.core import config
+        from pipecat.services.azure.llm import AzureLLMService
+        
+        if config.AZURE_OPENAI_API_KEY and config.AZURE_OPENAI_ENDPOINT:
+            # Create base connection to warm up
+            test_llm = AzureLLMService(
+                api_key=config.AZURE_OPENAI_API_KEY,
+                endpoint=config.AZURE_OPENAI_ENDPOINT,
+                model=config.AZURE_OPENAI_MODEL,
+            )
+            
+            # Store connection parameters in global cache
+            global _azure_llm_cache
+            _azure_llm_cache = {
+                'api_key': config.AZURE_OPENAI_API_KEY,
+                'endpoint': config.AZURE_OPENAI_ENDPOINT,
+                'model': config.AZURE_OPENAI_MODEL
+            }
+            
+            logger.info("Azure OpenAI connection pre-initialized")
+            
+    except Exception as e:
+        logger.debug(f"Azure LLM pre-init failed (will fallback): {e}")
+
+
+async def _pre_init_system_tools():
+    """Pre-initialize system tools that don't require configuration"""
+    try:
+        from app.agents.voice.automatic.tools.system import tool_functions as system_tool_functions
+        from app.core import config
+        
+        # Pre-load system tool functions only (tools contain non-serializable objects)
+        global _system_tools_cache
+        _system_tools_cache = {
+            'functions': system_tool_functions,
+            'modules_loaded': True
+        }
+        
+        # Pre-load chart tool functions if enabled
+        if config.ENABLE_CHARTS:
+            from app.agents.voice.automatic.tools.charts import tool_functions as chart_tool_functions
+            _system_tools_cache['chart_functions'] = chart_tool_functions
+            
+        # Pre-load internet tool functions if enabled
+        if config.ENABLE_SEARCH_GROUNDING:
+            from app.agents.voice.automatic.tools import internet
+            _system_tools_cache['internet_functions'] = internet.tool_functions
+            
+        logger.info("System tool functions pre-loaded")
+        
+    except Exception as e:
+        logger.debug(f"System tools pre-init failed (will fallback): {e}")
+
+
+async def _pre_init_silero_vad():
+    """Pre-initialize Silero VAD model"""
+    try:
+        from pipecat.audio.vad.silero import SileroVADAnalyzer
+        from pipecat.audio.vad.vad_analyzer import VADParams
+        from app.core import config
+        
+        # Pre-load the Silero VAD model
+        vad_params = VADParams(
+            confidence=config.VAD_CONFIDENCE,
+            start_secs=config.VAD_START_SECS,
+            stop_secs=config.VAD_STOP_SECS,
+            min_volume=config.VAD_MIN_VOLUME,
+        )
+        
+        test_vad = SileroVADAnalyzer(
+            sample_rate=config.SAMPLE_RATE,
+            params=vad_params,
+        )
+        
+        # Store in global cache for reuse
+        global _silero_vad_cache
+        _silero_vad_cache = {
+            'sample_rate': config.SAMPLE_RATE,
+            'params': vad_params
+        }
+        
+        logger.info("Silero VAD model pre-loaded")
+        
+    except Exception as e:
+        logger.debug(f"Silero VAD pre-init failed (will fallback): {e}")
+
+
+# Global caches for pre-initialized services
+_azure_llm_cache = None
+_system_tools_cache = None
+_silero_vad_cache = None
+
+
+def _get_cached_llm_service():
+    """Get LLM service using pre-initialized cache if available"""
+    global _azure_llm_cache
+    
+    if _azure_llm_cache:
+        logger.info("Using pre-initialized Azure LLM connection")
+        return LLMServiceWrapper(
+            AzureLLMService(
+                api_key=_azure_llm_cache['api_key'],
+                endpoint=_azure_llm_cache['endpoint'],
+                model=_azure_llm_cache['model'],
+            )
+        )
+    else:
+        # Fallback to normal initialization
+        logger.info("Using fallback Azure LLM initialization")
+        return LLMServiceWrapper(
+            AzureLLMService(
+                api_key=config.AZURE_OPENAI_API_KEY,
+                endpoint=config.AZURE_OPENAI_ENDPOINT,
+                model=config.AZURE_OPENAI_MODEL,
+            )
+        )
+
+
+async def handle_session(session_config):
+    """Handle a session with the given configuration"""
+    session_id = session_config.get("session_id")
+    
+    # Simple args object from session config
+    class SessionArgs:
+        def __init__(self, config):
+            for key, value in config.items():
+                setattr(self, key.replace("-", "_"), value)
+            # Map room_url to url for compatibility
+            self.url = config.get("room_url")
+    
+    session_args = SessionArgs(session_config)
+    
+    try:
+        await run_normal_mode(session_args)
+    except Exception as e:
+        logger.error(f"Session {session_id} ended with error: {e}")
+    finally:
+        logger.info(f"Session {session_id} completed, process ready for next session")
+        print("SESSION_ENDED", flush=True)
+
+
+async def run_normal_mode(args):
+    """Run the normal voice agent mode"""
+    # Validate required arguments for normal mode
+    if not args.url or not args.token or not args.session_id:
+        logger.error("Missing required arguments for normal mode")
+        return
 
     # Configure logger with session ID and client session ID for all logs in this subprocess
     configure_session_logger(args.session_id, args.client_sid)
@@ -131,18 +347,28 @@ async def main():
     # Personalize the system prompt if a user name is provided
     system_prompt = get_system_prompt(args.user_name, tts_provider)
 
-    # Configure VAD - use normal timeout for both cases
-    vad_params = VADParams(
-        confidence=config.VAD_CONFIDENCE,
-        start_secs=config.VAD_START_SECS,
-        stop_secs=config.VAD_STOP_SECS,  # Use normal timeout - Smart Turn will intercept and decide
-        min_volume=config.VAD_MIN_VOLUME,
-    )
+    # Configure VAD - use pre-initialized model if available
+    global _silero_vad_cache
+    if _silero_vad_cache:
+        logger.info("Using pre-initialized Silero VAD model")
+        vad_analyzer = SileroVADAnalyzer(
+            sample_rate=_silero_vad_cache['sample_rate'],
+            params=_silero_vad_cache['params'],
+        )
+    else:
+        # Fallback to normal initialization
+        logger.info("Using fallback Silero VAD initialization")
+        vad_params = VADParams(
+            confidence=config.VAD_CONFIDENCE,
+            start_secs=config.VAD_START_SECS,
+            stop_secs=config.VAD_STOP_SECS,  # Use normal timeout - Smart Turn will intercept and decide
+            min_volume=config.VAD_MIN_VOLUME,
+        )
 
-    vad_analyzer = SileroVADAnalyzer(
-        sample_rate=config.SAMPLE_RATE,
-        params=vad_params,
-    )
+        vad_analyzer = SileroVADAnalyzer(
+            sample_rate=config.SAMPLE_RATE,
+            params=vad_params,
+        )
 
     daily_params = DailyParams(
         audio_in_enabled=True,
@@ -199,36 +425,57 @@ async def main():
         enable_chart_text_filter=config.ENABLE_CHARTS,
     )
 
-    llm = LLMServiceWrapper(
-        AzureLLMService(
-            api_key=config.AZURE_OPENAI_API_KEY,
-            endpoint=config.AZURE_OPENAI_ENDPOINT,
-            model=config.AZURE_OPENAI_MODEL,
-        )
-    )
+    # Use pre-initialized Azure LLM if available
+    llm = _get_cached_llm_service()
 
     if not use_breeze_mcp_server:
-        if mode == Mode.LIVE:
-            tools, tool_functions = initialize_tools(
+        # Try to use cached tool functions first, fallback to normal initialization
+        global _system_tools_cache
+        if _system_tools_cache and _system_tools_cache.get('modules_loaded') and mode != Mode.LIVE:
+            logger.info("Using pre-initialized system tool functions")
+            
+            # We still need to get the tools objects, but we can reuse the cached functions
+            tool_functions = _system_tools_cache.get('functions', {}).copy()
+            
+            # Add chart tool functions if enabled
+            if config.ENABLE_CHARTS and 'chart_functions' in _system_tools_cache:
+                tool_functions.update(_system_tools_cache.get('chart_functions', {}))
+                
+            # Add internet tool functions if enabled
+            if config.ENABLE_SEARCH_GROUNDING and 'internet_functions' in _system_tools_cache:
+                tool_functions.update(_system_tools_cache.get('internet_functions', {}))
+            
+            # We still need to get the tools objects (they're needed for LLM context)
+            # But this should be faster since modules are already imported
+            tools, _ = initialize_tools(
                 mode=mode.value,
-                breeze_token=args.breeze_token,
-                euler_token=args.euler_token,
-                shop_url=args.shop_url,
-                shop_id=args.shop_id,
-                shop_type=args.shop_type,
                 merchant_id=args.merchant_id,
-                session_id=args.client_sid,  # Pass client_sid instead of session_id
-                user_id=args.user_name,
-                user_email=args.user_email,
+                session_id=args.client_sid,
                 reseller_id=args.reseller_id,
             )
         else:
-            tools, tool_functions = initialize_tools(
-                mode=mode.value,
-                merchant_id=args.merchant_id,
-                session_id=args.client_sid,  # Pass client_sid instead of session_id
-                reseller_id=args.reseller_id,
-            )
+            # Fallback to normal initialization for LIVE mode or if cache unavailable
+            if mode == Mode.LIVE:
+                tools, tool_functions = initialize_tools(
+                    mode=mode.value,
+                    breeze_token=args.breeze_token,
+                    euler_token=args.euler_token,
+                    shop_url=args.shop_url,
+                    shop_id=args.shop_id,
+                    shop_type=args.shop_type,
+                    merchant_id=args.merchant_id,
+                    session_id=args.client_sid,  # Pass client_sid instead of session_id
+                    user_id=args.user_name,
+                    user_email=args.user_email,
+                    reseller_id=args.reseller_id,
+                )
+            else:
+                tools, tool_functions = initialize_tools(
+                    mode=mode.value,
+                    merchant_id=args.merchant_id,
+                    session_id=args.client_sid,  # Pass client_sid instead of session_id
+                    reseller_id=args.reseller_id,
+                )
 
         for name, function in tool_functions.items():
             logger.info("Initializing the default function tools")
