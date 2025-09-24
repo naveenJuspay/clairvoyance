@@ -23,7 +23,8 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi import RTVIProcessor, RTVIServerMessageFrame
 
 from app.agents.voice.automatic.features.charts.chart_tools import (
-    reset_chart_turn_count,
+    mark_actionable_operation,
+    reset_chart_turn_state,
 )
 from app.agents.voice.automatic.features.charts.rtvi.rtvi import emit_chart_components
 from app.agents.voice.automatic.rtvi.rtvi import emit_rtvi_event
@@ -170,7 +171,7 @@ class LLMSpyProcessor(FrameProcessor):
                 await self.push_frame(frame, direction)
 
         elif isinstance(frame, UserStartedSpeakingFrame) and self._enable_charts:
-            reset_chart_turn_count(self._session_id)
+            reset_chart_turn_state(self._session_id)
             await self.push_frame(frame, direction)
 
         # LLM Response Start - begin collecting text and start conversation turn
@@ -284,6 +285,18 @@ class LLMSpyProcessor(FrameProcessor):
             await self.push_frame(frame, direction)
 
             if self._enable_charts:
+                # Check if tool result contains isActionable flag
+                try:
+                    if isinstance(frame.result, dict) and frame.result.get(
+                        "isActionable", False
+                    ):
+                        mark_actionable_operation(self._session_id)
+                        logger.debug(
+                            f"[{self._session_id}] Marked actionable operation for tool: {frame.function_name}"
+                        )
+                except Exception as e:
+                    logger.debug(f"Error checking isActionable flag: {e}")
+
                 # Track in conversation via ConversationManager (may complete turn)
                 events = await self._conversation_manager.add_tool_result_with_events(
                     self._session_id,

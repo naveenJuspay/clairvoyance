@@ -750,6 +750,7 @@ async def create_euler_offer(params: FunctionCallParams):
                         "status": "success",
                         "offerId": offer_id,
                         "message": f"Successfully created offer {offer_code}",
+                        "isActionable": True,
                         "details": {
                             "offerCode": offer_code,
                             "type": offer_type,
@@ -994,6 +995,7 @@ async def delete_euler_offer(params: FunctionCallParams):
                 success_result = {
                     "status": "success",
                     "message": f"Successfully deleted offer '{offer_code}'",
+                    "isActionable": True,
                     "details": {
                         "offerCode": offer_code,
                         "offerId": offer_id,
@@ -1212,6 +1214,7 @@ async def update_euler_offer(params: FunctionCallParams):
                     success_result = {
                         "status": "success",
                         "message": f"Successfully {action} offer '{offer_code}'",
+                        "isActionable": True,
                         "details": {
                             "offerCode": offer_code,
                             "offerId": offer_id,
@@ -1555,6 +1558,7 @@ async def update_euler_offer(params: FunctionCallParams):
                 success_result = {
                     "status": "success",
                     "message": f"Successfully updated offer '{offer_code}' details",
+                    "isActionable": True,
                     "details": {
                         "offerCode": offer_code,
                         "offerId": offer_id,

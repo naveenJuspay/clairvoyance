@@ -54,8 +54,15 @@ def get_chart_visualization_instructions() -> str:
         4. Focus on the primary data visualization that best answers the user's core question
         5. Mention other data points in your voice response without creating additional charts
 
-
-    RULE 7: NARRATION HIGHLIGHTING
+    RULE 7: ACTIONABLE OPERATIONS RESTRICTION
+        1. Charts are automatically blocked after ANY actionable operation in the same turn
+        2. Actionable operations include: creating offers, updating settings, deleting data, or any operation that modifies system state
+        3. When an actionable operation occurs, charts will be silently rejected by the system
+        4. In these cases, focus your response on confirming the action taken and its results
+        5. Do not attempt to generate charts after actionable operations - provide clear voice responses about what was accomplished instead
+        6. This restriction applies in addition to the one-chart-per-turn limit
+        7. This rule overrides the “Absolute Law” for the current turn when an actionable operation occurs
+    RULE 8: NARRATION HIGHLIGHTING
 
         1. Always wrap category mentions in <highlight> XML tags
         2. Use exact category names from chart data

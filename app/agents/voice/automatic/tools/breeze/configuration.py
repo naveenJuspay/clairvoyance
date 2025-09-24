@@ -193,6 +193,10 @@ async def manage_announcement_banner(params: FunctionCallParams):
                         f"Tool Error: [manage_announcement_banner] Failed to fetch updated configuration: {e}"
                     )
 
+            # Add isActionable flag for all banner operations
+            if patch_result and isinstance(patch_result, dict):
+                patch_result["isActionable"] = True
+
             # Return the patch_result
             await params.result_callback(patch_result)
         else:
@@ -211,6 +215,7 @@ async def manage_announcement_banner(params: FunctionCallParams):
             {
                 "success": False,
                 "Tool Error": f" [manage_announcement_banner] Error: {error_message}",
+                "isActionable": True,
             }
         )
 
